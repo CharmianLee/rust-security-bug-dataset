@@ -1,151 +1,68 @@
 // Minimal use, example:
-use std::{mem, slice};
+use std::mem::{self, ManuallyDrop};
 
 // SECTION 1: MINIMAL TYPES, TRAITS, AND HELPER FUNCTIONS
-macro_rules! copy {
-    ($src:expr, $src_start:expr, $dest:expr, $dest_start:expr, $len:expr) => {
-        (&mut $dest[$dest_start..$dest_start+$len]).copy_from_slice(&$src[$src_start..$src_start+$len])
-    };
+/// A minimal stub for `tracing::Span`.
+#[derive(Debug, Clone, Copy)]
+pub struct Span {
+    // A dummy field to give the struct a non-zero size
+    id: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct Buffer {
-    array: Box<[u8]>,
-    head: usize,
-    len: usize,
-}
-
-impl Buffer {
-    pub const DEFAULT_CAPACITY: usize = 4096;
-
-    /// Create a new buffer with the default capacity.
+impl Span {
+    /// A simple constructor for the stub type.
     pub fn new() -> Self {
-        Self::with_capacity(Self::DEFAULT_CAPACITY)
+        Self { id: 1 }
     }
+}
 
-    /// Create a new buffer with a given minimum capacity pre-allocated.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            array: Buffer::allocate(capacity.next_power_of_two()),
-            head: 0,
-            len: 0,
-        }
-    }
-
-    /// Copy bytes from the front of the buffer into the given slice.
-    ///
-    /// Returns the number of bytes copied. If there are less bytes in the buffer than the length of `dest`, then only
-    /// part of `dest` will be written to.
-    pub fn copy_to(&self, dest: &mut [u8]) -> usize {
-        // Determine the number of bytes to copy.
-        let count = dest.len().min(self.len);
-
-        // Nothing to do.
-        if count == 0 {
-            return 0;
-        }
-
-        // Current buffer is wrapped; copy head segment and tail segment separately.
-        let tail = self.offset(count);
-        if tail <= self.head {
-            let head_len = self.capacity() - self.head;
-            copy!(self.array, self.head, dest, 0, head_len);
-            copy!(self.array, 0, dest, head_len, tail);
-        }
-
-        // Buffer is contiguous; copy in one step.
-        else {
-            copy!(self.array, self.head, dest, 0, count);
-        }
-
-        count
-    }
-
-    /// Calculate the internal offset of the given byte position.
-    fn offset(&self, index: usize) -> usize {
-        let mut offset = self.head + index;
-
-        if offset >= self.capacity() {
-            offset -= self.capacity();
-        }
-
-        offset
-    }
-
-    /// Allocate an array of memory on the heap.
-    ///
-    /// Note that the contents of the array are not initialized and the values are undefined. This is safe only because
-    /// we are asking for an array of bytes anyway.
-    fn allocate(size: usize) -> Box<[u8]> {
-        unsafe {
-            let mut vec = Vec::<u8>::with_capacity(size);
-            let slice = slice::from_raw_parts_mut(vec.as_mut_ptr(), vec.capacity());
-            mem::forget(vec);
-            Box::from_raw(slice)
-        }
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.array.len()
-    }
-
-    /// Copy the given bytes and insert them into the back of the buffer.
-    pub fn push(&mut self, src: &[u8]) {
-        let new_len = self.len + src.len();
-
-        // If the number of bytes to add would exceed the capacity, grow the internal array first.
-        if new_len > self.capacity() {
-            let new_capacity = new_len.next_power_of_two();
-            let mut new_array = Self::allocate(new_capacity);
-
-            self.copy_to(&mut new_array);
-            self.array = new_array;
-            self.head = 0;
-        }
-
-        // Calculate how much of `src` should be copied to which regions.
-        let head_available = self.capacity().checked_sub(self.head + self.len).unwrap_or(0);
-        let copy_to_head = src.len().min(head_available);
-        let copy_to_tail = src.len() - copy_to_head;
-
-        if copy_to_head > 0 {
-            let tail = self.offset(self.len);
-            copy!(src, 0, self.array, tail, copy_to_head);
-        }
-
-        if copy_to_tail > 0 {
-            copy!(src, copy_to_head, self.array, 0, copy_to_tail);
-        }
-
-        self.len = new_len;
-    }
+/// A minimal definition of `Instrumented<T>` containing only the fields
+#[derive(Debug)]
+pub struct Instrumented<T> {
+    inner: ManuallyDrop<T>,
+    span: Span,
 }
 
 // SECTION 2: PATCHED CODE
-// Example:
-impl From<Buffer> for Vec<u8> {
-    fn from(buffer: Buffer) -> Vec<u8> {
-        let mut slice = unsafe {
-            Buffer::allocate(buffer.len)
-        };
-        let len = buffer.copy_to(&mut slice);
-
-        unsafe {
-            let vec = Vec::from_raw_parts(slice.as_mut_ptr(), len, slice.len());
-            mem::forget(slice);
-            vec
+impl<T> Instrumented<T> {
+    /// A simplified constructor to create an `Instrumented` instance for the PoC.
+    pub fn new(value: T, span: Span) -> Self {
+        Self {
+            inner: ManuallyDrop::new(value),
+            span,
         }
+    }
+
+    /// Consumes the `Instrumented`, returning the wrapped type.
+    ///
+    /// Note that this drops the span.
+    pub fn into_inner(self) -> T {
+        // To manually destructure `Instrumented` without `Drop`, we
+        // move it into a ManuallyDrop and use pointers to its fields
+        let this = ManuallyDrop::new(self);
+        let span: *const Span = &this.span;
+        let inner: *const ManuallyDrop<T> = &this.inner;
+        // SAFETY: Those pointers are valid for reads, because `Drop` didn't
+        //         run, and properly aligned, because `Instrumented` isn't
+        //         `#[repr(packed)]`.
+        let _span = unsafe { span.read() };
+        let inner = unsafe { inner.read() };
+        ManuallyDrop::into_inner(inner)
     }
 }
 
 // SECTION 3: PROOF-OF-CONCEPT
 fn main() {
     // 1. Setup vulnerable object
-    let mut buffer = Buffer::with_capacity(16);
-    buffer.push(b"some initial data");
+    let large_vector: Vec<u8> = vec![0; 10 * 1024 * 1024]; 
+    println!(
+        "Created a Vec<u8> with capacity: {} bytes",
+        large_vector.capacity()
+    );
+    let span = Span::new();
+    let instrumented_object = Instrumented::new(large_vector, span);
     
     // 2. Trigger BUG
-    let vec = Vec::from(buffer);
-    println!("{:?}", &vec[..]);
+    let _extracted_vec = instrumented_object.into_inner();
+    println!("Called into_inner(). The 10MB of memory is not leaked.");
 }

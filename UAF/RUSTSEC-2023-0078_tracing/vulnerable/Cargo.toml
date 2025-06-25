@@ -1,6 +1,6 @@
 [package]
 name = "tracing-v"
-version = "0.1.2"
+version = "0.1.38"
 
 [dependencies]
 pin-project-lite = "0.2.9"
