@@ -1,0 +1,5 @@
+[package]
+name = "bumpalo-v"
+version = "3.11.0"
+
+[dependencies]

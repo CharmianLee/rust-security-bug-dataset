@@ -1,0 +1,9 @@
+{
+    "id": "RUSTSEC-2022-0078",
+    "crate": "bumpalo",
+    "description": "In affected versions of this crate, the lifetime of the iterator produced by Vec::into_iter() is not constrained to the lifetime of the Bump that allocated the vector's memory. Using the iterator after the Bump is dropped causes use-after-free accesses.",
+    "bug_type": "Use-After-Free",
+    "reference": "https://github.com/fitzgen/bumpalo/blob/main/CHANGELOG.md#3111 ",
+    "vulnerable_version": "3.11.0",
+    "patched_version": "3.11.1"
+}
