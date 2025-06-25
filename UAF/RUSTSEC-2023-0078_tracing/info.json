@@ -1,0 +1,9 @@
+{
+    "id": "RUSTSEC-2023-0078",
+    "crate": "tracing",
+    "description": "The implementation of the Instrumented::into_inner method in affected versions of this crate contains undefined behavior due to incorrect use of std::mem::forget The function creates *const pointers to self, calls mem::forget(self), and then moves values out of those pointers using std::ptr::read. This means that these pointers are no longer valid. This could result in a stack use-after-free if LLVM chooses to reuse self's stack slot for a rebinding after the call to std::mem::forget.",
+    "bug_type": "Use-After-Free",
+    "reference": "https://github.com/tokio-rs/tracing/pull/2765",
+    "vulnerable_version": "0.1.38",
+    "patched_version": "0.1.40"
+}

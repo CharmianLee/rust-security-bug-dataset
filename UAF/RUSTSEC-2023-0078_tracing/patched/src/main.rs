@@ -122,14 +122,17 @@ impl Buffer {
     }
 }
 
-// SECTION 2: VULNERABLE CODE
+// SECTION 2: PATCHED CODE
+// Example:
 impl From<Buffer> for Vec<u8> {
     fn from(buffer: Buffer) -> Vec<u8> {
-        let mut slice = Buffer::allocate(buffer.len);
+        let mut slice = unsafe {
+            Buffer::allocate(buffer.len)
+        };
         let len = buffer.copy_to(&mut slice);
 
         unsafe {
-            Vec::from_raw_parts(slice.as_mut_ptr(), len, slice.len());
+            let vec = Vec::from_raw_parts(slice.as_mut_ptr(), len, slice.len());
             mem::forget(slice);
             vec
         }
@@ -144,5 +147,5 @@ fn main() {
     
     // 2. Trigger BUG
     let vec = Vec::from(buffer);
-    drop(vec);
+    println!("{:?}", &vec[..]);
 }
