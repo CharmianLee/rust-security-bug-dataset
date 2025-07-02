@@ -37,7 +37,7 @@ impl<T> Instrumented<T> {
 }
 ```
 
-## Trigger Method:
+## Trigger Method:(customized)
 ```rust
 fn main() {
     // 1. Setup vulnerable object.
