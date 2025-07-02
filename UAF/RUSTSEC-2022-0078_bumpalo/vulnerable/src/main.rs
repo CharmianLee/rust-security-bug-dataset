@@ -1,154 +1,89 @@
-// main.rs
+#![allow(clippy::new_without_default)]
+// SECTION 1: MINIMAL DEPENDENCIES
 
-use std::alloc::{alloc, dealloc, Layout};
-use std::cell::Cell;
+use std::alloc::Layout;
+use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::{self, NonNull};
 
-// SECTION 1: MINIMAL TYPES, TRAITS, AND HELPER FUNCTIONS
-
-// --- Helper constants and functions ---
-
-const CHUNK_ALIGN: usize = 16;
-const FOOTER_SIZE: usize = mem::size_of::<ChunkFooter>();
-// A smaller size for a quicker PoC
-const DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER: usize = 1024 - FOOTER_SIZE;
-
-#[inline(never)]
-#[cold]
-fn oom() -> ! {
-    panic!("out of memory");
+// Helper functions
+fn capacity_overflow() -> ! {
+    panic!("capacity overflow")
 }
 
-#[inline]
+fn handle_alloc_error(layout: Layout) -> ! {
+    panic!("encountered allocation error: {:?}", layout)
+}
+
 unsafe fn arith_offset<T>(p: *const T, offset: isize) -> *const T {
-    (p as *const u8).offset(offset as isize * mem::size_of::<T>() as isize) as *const T
+    p.offset(offset)
 }
 
-// --- Allocator related structs ---
-
-#[repr(C)]
-struct ChunkFooter {
-    data: NonNull<u8>,
-    layout: Layout,
-    prev: Cell<NonNull<ChunkFooter>>,
-    ptr: Cell<NonNull<u8>>,
+unsafe fn offset_from<T>(p: *const T, origin: *const T) -> isize
+where
+    T: Sized,
+{
+    let pointee_size = mem::size_of::<T>();
+    assert!(0 < pointee_size && pointee_size <= isize::MAX as usize);
+    isize::wrapping_sub(p as _, origin as _) / (pointee_size as isize)
 }
 
-#[derive(Debug)]
+// Simplified Bump allocator that correctly models arena-like deallocation on drop.
 pub struct Bump {
-    current_chunk_footer: Cell<NonNull<ChunkFooter>>,
+    // Use the standard library's Vec for internal bookkeeping.
+    allocations: RefCell<std::vec::Vec<(NonNull<u8>, Layout)>>,
 }
 
 impl Bump {
-    pub fn new() -> Bump {
-        // A simplified `new` that creates an initial empty chunk marker.
-        // The first real allocation will trigger `alloc_layout_slow`.
-        static mut EMPTY_CHUNK_FOOTER: ChunkFooter = ChunkFooter {
-            data: NonNull::dangling(),
-            layout: unsafe { Layout::from_size_align_unchecked(0, CHUNK_ALIGN) },
-            prev: Cell::new(NonNull::dangling()),
-            ptr: Cell::new(NonNull::dangling()),
-        };
-        unsafe {
-            // Point to itself to terminate the list
-            EMPTY_CHUNK_FOOTER.prev.set(NonNull::from(&EMPTY_CHUNK_FOOTER));
-            Bump {
-                current_chunk_footer: Cell::new(NonNull::from(&EMPTY_CHUNK_FOOTER)),
-            }
+    pub fn new() -> Self {
+        Bump {
+            // Call the standard Vec's `new` method.
+            allocations: RefCell::new(std::vec::Vec::new()),
         }
     }
-    
-    #[allow(clippy::mut_from_ref)]
+
+    #[inline(always)]
     pub fn alloc<T>(&self, val: T) -> &mut T {
+        self.alloc_with(|| val)
+    }
+
+    #[inline(always)]
+    pub fn alloc_with<F, T>(&self, f: F) -> &mut T
+    where
+        F: FnOnce() -> T,
+    {
         let layout = Layout::new::<T>();
         unsafe {
-            let p = self.alloc_layout(layout);
-            let p = p.as_ptr() as *mut T;
-            ptr::write(p, val);
+            let p = self.alloc_layout(layout).as_ptr() as *mut T;
+            ptr::write(p, f());
             &mut *p
         }
     }
 
-    #[inline(always)]
-    pub fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
-        if let Some(p) = self.try_alloc_layout_fast(layout) {
-            p
-        } else {
-            self.alloc_layout_slow(layout).unwrap_or_else(|| oom())
-        }
-    }
-
-    #[inline(always)]
-    fn try_alloc_layout_fast(&self, layout: Layout) -> Option<NonNull<u8>> {
-        unsafe {
-            let footer = self.current_chunk_footer.get().as_ref();
-            // The empty chunk has a dangling data pointer
-            if footer.data == NonNull::dangling() {
-                return None;
-            }
-            let ptr = footer.ptr.get().as_ptr();
-            let start = footer.data.as_ptr();
-
-            let aligned_ptr = (ptr as usize).saturating_sub(layout.size()) & !(layout.align() - 1);
-
-            if aligned_ptr >= start as usize {
-                let aligned_ptr = NonNull::new_unchecked(aligned_ptr as *mut u8);
-                footer.ptr.set(aligned_ptr);
-                Some(aligned_ptr)
-            } else {
-                None
-            }
-        }
-    }
-    
-    #[inline(never)]
-    fn alloc_layout_slow(&self, layout: Layout) -> Option<NonNull<u8>> {
-        unsafe {
-            let new_chunk_size = (layout.size() + FOOTER_SIZE).max(DEFAULT_CHUNK_SIZE_WITHOUT_FOOTER + FOOTER_SIZE);
-            let new_chunk_layout = Layout::from_size_align(new_chunk_size, CHUNK_ALIGN).ok()?;
-            let new_chunk_data = alloc(new_chunk_layout);
-
-            if new_chunk_data.is_null() { return None; }
-
-            let footer_ptr = new_chunk_data.add(new_chunk_size - FOOTER_SIZE) as *mut ChunkFooter;
-            
-            ptr::write(
-                footer_ptr,
-                ChunkFooter {
-                    data: NonNull::new_unchecked(new_chunk_data),
-                    layout: new_chunk_layout,
-                    prev: self.current_chunk_footer.clone(),
-                    ptr: Cell::new(NonNull::new_unchecked(footer_ptr as *mut u8)),
-                },
-            );
-
-            self.current_chunk_footer.set(NonNull::new_unchecked(footer_ptr));
-            self.try_alloc_layout_fast(layout)
-        }
-    }
-}
-
-unsafe fn dealloc_chunk_list(mut footer: NonNull<ChunkFooter>) {
-    // Check if it's the self-referencing empty chunk
-    while footer.as_ref().prev.get() != footer {
-        let f = footer;
-        footer = f.as_ref().prev.get();
-        dealloc(f.as_ref().data.as_ptr(), f.as_ref().layout);
+    // This function now panics on allocation failure, removing the need for the unstable `AllocError`.
+    fn alloc_layout(&self, layout: Layout) -> NonNull<u8> {
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        let non_null_ptr = match NonNull::new(ptr) {
+            Some(p) => p,
+            None => handle_alloc_error(layout),
+        };
+        self.allocations.borrow_mut().push((non_null_ptr, layout));
+        non_null_ptr
     }
 }
 
 impl Drop for Bump {
     fn drop(&mut self) {
-        unsafe {
-            dealloc_chunk_list(self.current_chunk_footer.get());
+        for (ptr, layout) in self.allocations.get_mut().iter() {
+            unsafe {
+                std::alloc::dealloc(ptr.as_ptr(), *layout);
+            }
         }
     }
 }
 
-// --- Vector related structs ---
-
+// Minimal definitions for Vec (as defined in the crate)
 pub struct RawVec<'a, T> {
     ptr: NonNull<T>,
     cap: usize,
@@ -164,23 +99,31 @@ impl<'a, T> RawVec<'a, T> {
         }
     }
 
-    // Simplified reserve for PoC. Does not realloc, just gets new block.
-    fn reserve(&mut self, len: usize, additional: usize) {
-        if self.cap - len >= additional {
-            return;
-        }
-        let new_cap = (len + additional).next_power_of_two().max(4);
-        let new_layout = Layout::array::<T>(new_cap).expect("Layout error");
+    fn grow(&mut self, len: usize, additional: usize) {
+        let required_cap = len.checked_add(additional).unwrap_or_else(|| capacity_overflow());
+        let new_cap = required_cap.max(self.cap * 2).max(1);
+        let new_layout = Layout::array::<T>(new_cap).unwrap_or_else(|_| capacity_overflow());
+
         let new_ptr = self.a.alloc_layout(new_layout);
 
-        unsafe {
-            if self.cap > 0 && len > 0 {
-                ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr() as *mut T, len);
-            }
-            self.ptr = NonNull::new(new_ptr.as_ptr() as *mut T).unwrap();
-            self.cap = new_cap;
+        if self.cap > 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr.as_ptr(), new_ptr.as_ptr() as *mut T, self.cap);
+            };
+        }
+        self.ptr = new_ptr.cast();
+        self.cap = new_cap;
+    }
+
+    pub fn reserve(&mut self, len: usize, additional: usize) {
+        if self.cap - len < additional {
+            self.grow(len, additional);
         }
     }
+
+    fn ptr(&self) -> *mut T { self.ptr.as_ptr() }
+
+    fn cap(&self) -> usize { self.cap }
 }
 
 pub struct Vec<'bump, T: 'bump> {
@@ -195,13 +138,21 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
             len: 0,
         }
     }
-    
+
+    #[inline] pub fn len(&self) -> usize { self.len }
+    #[inline] pub fn as_mut_ptr(&mut self) -> *mut T { self.buf.ptr() }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.buf.reserve(self.len, additional);
+    }
+
+    #[inline]
     pub fn push(&mut self, value: T) {
-        if self.len == self.buf.cap {
-            self.buf.reserve(self.len, 1);
+        if self.len == self.buf.cap() {
+            self.reserve(1);
         }
         unsafe {
-            let end = self.buf.ptr.as_ptr().add(self.len);
+            let end = self.buf.ptr().add(self.len);
             ptr::write(end, value);
             self.len += 1;
         }
@@ -209,56 +160,38 @@ impl<'bump, T: 'bump> Vec<'bump, T> {
 }
 
 impl<'bump, T: 'bump> Extend<T> for Vec<'bump, T> {
+    #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         let iter = iter.into_iter();
-        let (lower, _) = iter.size_hint();
-        self.buf.reserve(self.len, lower);
+        self.reserve(iter.size_hint().0);
         for t in iter {
             self.push(t);
         }
     }
 }
 
-impl<'bump, T> Drop for Vec<'bump, T> {
-    fn drop(&mut self) {
-        if self.buf.cap > 0 {
-            unsafe {
-                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
-                    self.buf.ptr.as_ptr(),
-                    self.len,
-                ));
-            }
-        }
-    }
-}
+// SECTION 2: VULNERABLE CODE
 
-// --- Iterator struct (part of the vulnerability) ---
-
-// The vulnerable iterator. Note the lack of a 'bump lifetime.
+// The IntoIter struct does not have a lifetime parameter `'bump`
+// to tie it to the lifetime of the Bump allocator.
 pub struct IntoIter<T> {
     phantom: PhantomData<T>,
     ptr: *const T,
     end: *const T,
 }
 
-// SECTION 2: VULNERABLE CODE
-
-// This `IntoIterator` impl is the source of the vulnerability.
-// It creates an `IntoIter<T>` that does not borrow the bump allocator,
-// allowing it to outlive the memory it points to.
 impl<'bump, T: 'bump> IntoIterator for Vec<'bump, T> {
     type Item = T;
     type IntoIter = IntoIter<T>;
 
     #[inline]
-    // CORRECTED: `mut` is not needed for `self`.
-    fn into_iter(self) -> IntoIter<T> {
+    fn into_iter(mut self) -> IntoIter<T> {
         unsafe {
-            let begin = self.buf.ptr.as_ptr();
+            let begin = self.as_mut_ptr();
             let end = if mem::size_of::<T>() == 0 {
-                arith_offset(begin as *const i8, self.len as isize) as *const T
+                arith_offset(begin as *const i8, self.len() as isize) as *const T
             } else {
-                begin.add(self.len) as *const T
+                begin.add(self.len())
             };
             mem::forget(self);
             IntoIter {
@@ -270,52 +203,63 @@ impl<'bump, T: 'bump> IntoIterator for Vec<'bump, T> {
     }
 }
 
-// The iterator implementation performs the use-after-free read.
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
 
     #[inline]
     fn next(&mut self) -> Option<T> {
         unsafe {
-            if self.ptr == self.end {
+            if self.ptr as *const _ == self.end {
                 None
+            } else if mem::size_of::<T>() == 0 {
+                self.ptr = arith_offset(self.ptr as *const i8, 1) as *mut T;
+                Some(mem::zeroed())
             } else {
                 let old = self.ptr;
-                self.ptr = self.ptr.add(1);
+                self.ptr = self.ptr.offset(1);
                 Some(ptr::read(old))
             }
         }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let exact = if mem::size_of::<T>() == 0 {
+            (self.end as usize).wrapping_sub(self.ptr as usize)
+        } else {
+            unsafe { offset_from(self.end, self.ptr) as usize }
+        };
+        (exact, Some(exact))
     }
 }
 
 // SECTION 3: PROOF-OF-CONCEPT
 
 fn main() {
-    // 1. Setup allocator and vector
+    // 1. Setup a vector allocated within a bump arena.
     let bump = Bump::new();
     let mut vec = Vec::new_in(&bump);
     vec.extend([0x01u8; 32]);
+    let mut into_iter = vec.into_iter();
 
-    // 2. Create an iterator that now has pointers into `bump`'s memory
-    let into_iter = vec.into_iter();
-
-    // 3. Trigger BUG: Drop the allocator, freeing its memory.
-    // The `into_iter` now holds dangling pointers.
+    // 2. Trigger BUG: Drop the bump arena, freeing the memory that backs the iterator.
     drop(bump);
 
-    // 4. Re-allocate memory, hoping the OS reuses the same memory region.
-    // This makes the UAF observable by printing different data.
+    // 3. Re-allocate the freed memory with a different data pattern.
+    // This makes the UAF observable.
     for _ in 0..100 {
+        // This allocation is likely to reuse the memory freed by dropping the first bump.
         let reuse_bump = Bump::new();
-        // Allocate something else in the (potentially) same memory region
-        let _reuse_alloc = reuse_bump.alloc([0x41u8; 10]);
-        // `reuse_bump` is dropped here, its memory freed again.
+        let _reuse_alloc = reuse_bump.alloc([0x41u8; 64]);
+        // The reuse_bump is dropped here.
     }
 
-    // 5. Use the dangling iterator, causing a Use-After-Free.
-    // This will likely print `0x41` or other garbage instead of the original `0x01`.
-    for x in into_iter {
-        print!("0x{:02x} ", x);
-    }
-    println!();
+    // 4. Access the dangling iterator and verify data corruption.
+    // The original value was 0x01. If we read a different value (e.g., 0x41),
+    // the Use-After-Free is confirmed.
+    let first_val = into_iter.next().unwrap_or(0);
+    println!("Read from dangling iterator: 0x{:02x}", first_val);
+
+    // If the memory was reused, the value will not be the original 0x01.
+    assert_eq!(first_val, 0x01, "UAF CONFIRMED: memory was overwritten!");
 }
