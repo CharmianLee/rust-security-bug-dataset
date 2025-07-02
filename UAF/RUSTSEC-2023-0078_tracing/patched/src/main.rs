@@ -1,44 +1,59 @@
-// Minimal use, example:
-use std::mem::{self, ManuallyDrop};
+// SECTION 1: MINIMAL DEPENDENCIES
 
-// SECTION 1: MINIMAL TYPES, TRAITS, AND HELPER FUNCTIONS
-/// A minimal stub for `tracing::Span`.
-#[derive(Debug, Clone, Copy)]
+use std::mem::{self, ManuallyDrop};
+use std::ptr;
+
+// Minimal definition for `tracing::Metadata`
+#[derive(Debug, Clone)]
+pub struct Metadata<'a> {
+    _name: &'a str,
+}
+
+static METADATA: Metadata<'static> = Metadata { _name: "poc_span" };
+
+// Minimal definition for `tracing::span::Inner`
+#[derive(Debug, Clone)]
+pub struct Inner;
+
+// Minimal definition for `tracing::Span`
+#[derive(Clone, Debug)]
 pub struct Span {
-    // A dummy field to give the struct a non-zero size
-    id: u64,
+    _inner: Option<Inner>,
+    _meta: Option<&'static Metadata<'static>>,
 }
 
 impl Span {
-    /// A simple constructor for the stub type.
     pub fn new() -> Self {
-        Self { id: 1 }
+        Self {
+            _inner: Some(Inner),
+            _meta: Some(&METADATA),
+        }
     }
 }
 
-/// A simple type to be wrapped by `Instrumented`.
-#[derive(Debug)]
-struct MyType {
-    data: u32,
-}
-
-/// A minimal definition of `Instrumented<T>` containing only the fields
-#[derive(Debug)]
+// Minimal definition for `tracing::Instrumented<T>`
+// This struct mirrors the memory layout of the original without depending on `pin-project`.
+#[derive(Debug, Clone)]
 pub struct Instrumented<T> {
     inner: ManuallyDrop<T>,
     span: Span,
 }
 
-// SECTION 2: PATCHED CODE
+// A constructor is added here to facilitate the PoC setup.
 impl<T> Instrumented<T> {
-    /// A simplified constructor to create an `Instrumented` instance for the PoC.
-    pub fn new(value: T, span: Span) -> Self {
+    pub fn new(inner: T) -> Self {
         Self {
-            inner: ManuallyDrop::new(value),
-            span,
+            inner: ManuallyDrop::new(inner),
+            span: Span::new(),
         }
     }
+}
 
+
+// SECTION 2: PATCHED CODE
+
+// This `impl` block contains the patched, safe version of the `into_inner` function.
+impl<T> Instrumented<T> {
     /// Consumes the `Instrumented`, returning the wrapped type.
     ///
     /// Note that this drops the span.
@@ -57,14 +72,25 @@ impl<T> Instrumented<T> {
     }
 }
 
+
 // SECTION 3: PROOF-OF-CONCEPT
+
 fn main() {
-    // 1. Setup vulnerable object
-    let my_value = MyType { data: 42 };
-    let span = Span::new();
-    let instrumented_object = Instrumented::new(my_value, span);
-    
-    // 2. Trigger BUG
-    let extracted_value = instrumented_object.into_inner();
-    println!("{:?}", extracted_value);
+    // 1. Setup object.
+    // The setup remains identical to the vulnerable version.
+    let original_string = String::from("this value should be preserved");
+    let instrumented = Instrumented::new(original_string.clone());
+
+    // 2. Trigger the safe method.
+    // This call now uses the patched `into_inner` function, which is free of
+    // undefined behavior.
+    let returned_string = instrumented.into_inner();
+
+    // 3. Verify the result.
+    // The assertion confirms that the data integrity is maintained, and now
+    // this behavior is guaranteed by the language's safety rules, not by chance.
+    println!("Original string:  \"{}\"", original_string);
+    println!("Returned string:  \"{}\"", returned_string);
+    assert_eq!(original_string, returned_string);
+    println!("Verification successful: The string data was correctly preserved.");
 }

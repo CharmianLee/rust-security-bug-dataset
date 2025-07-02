@@ -1,63 +1,25 @@
-// SECTION 1: MINIMAL DEPENDENCIES
+## Dependencies:(omissible)
+- Crates:
+  - `std`
+- Modules:
+  - N/A (all code is in a single file)
+- Types:
+  - Structs: `Instrumented<T>`, `Span`, `Inner`, `Metadata<'static>`, `std::mem::ManuallyDrop<T>`, `std::string::String`
+  - Primitive Types: `&'static str`
+- Traits:
+  - `Debug`, `Clone`
+- Functions and Methods:
+  - Associated Functions: `Instrumented::new`, `Span::new`
+  - Methods: `Instrumented::into_inner`
+  - Free Functions: `std::mem::forget`, `std::ptr::read`, `std::mem::ManuallyDrop::into_inner`
+- Constants:
+  - `METADATA: Metadata<'static>`
+- Macros:
+  - `println!`, `assert_eq!`
 
-use std::mem::{self, ManuallyDrop};
-use std::ptr;
-
-// Minimal definition for `tracing::Metadata`
-#[derive(Debug, Clone)]
-pub struct Metadata<'a> {
-    _name: &'a str,
-}
-
-static METADATA: Metadata<'static> = Metadata { _name: "poc_span" };
-
-// Minimal definition for `tracing::span::Inner`
-#[derive(Debug, Clone)]
-pub struct Inner;
-
-// Minimal definition for `tracing::Span`
-#[derive(Clone, Debug)]
-pub struct Span {
-    _inner: Option<Inner>,
-    _meta: Option<&'static Metadata<'static>>,
-}
-
-impl Span {
-    pub fn new() -> Self {
-        Self {
-            _inner: Some(Inner),
-            _meta: Some(&METADATA),
-        }
-    }
-}
-
-// Minimal definition for `tracing::Instrumented<T>`
-// This struct mirrors the memory layout of the original without depending on `pin-project`.
-#[derive(Debug, Clone)]
-pub struct Instrumented<T> {
-    inner: ManuallyDrop<T>,
-    span: Span,
-}
-
-// A constructor is added here to facilitate the PoC setup.
+## Vulnerable Code:
+```rust
 impl<T> Instrumented<T> {
-    pub fn new(inner: T) -> Self {
-        Self {
-            inner: ManuallyDrop::new(inner),
-            span: Span::new(),
-        }
-    }
-}
-
-
-// SECTION 2: VULNERABLE CODE
-
-// This `impl` block contains the vulnerable function `into_inner`, copied from the
-// affected version of the `tracing` crate.
-impl<T> Instrumented<T> {
-    /// Consumes the `Instrumented`, returning the wrapped type.
-    ///
-    /// Note that this drops the span.
     pub fn into_inner(self) -> T {
         // To manually destructure `Instrumented` without `Drop`, we save
         // pointers to the fields and use `mem::forget` to leave those pointers
@@ -73,10 +35,10 @@ impl<T> Instrumented<T> {
         ManuallyDrop::into_inner(inner)
     }
 }
+```
 
-
-// SECTION 3: PROOF-OF-CONCEPT
-
+## Trigger Method:
+```rust
 fn main() {
     // 1. Setup vulnerable object.
     // If the stack memory for `instrumented` is corrupted after `mem::forget`,
@@ -99,3 +61,4 @@ fn main() {
     assert_eq!(original_string, returned_string);
     println!("Verification successful: The string data was not corrupted.");
 }
+```
